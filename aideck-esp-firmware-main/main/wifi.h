@@ -32,25 +32,35 @@
 #define WIFI_TRANSPORT_MTU 1022
 
 #if WIFI_TRANSPORT_MTU > CPX_MAX_PAYLOAD_SIZE
-    #pragma warn "WIFI MTU bigger than defined by CPX"
+#pragma warn "WIFI MTU bigger than defined by CPX"
 #endif
 
-typedef struct {
+#ifndef WIFI_PEER_TCP_PORT
+#define WIFI_PEER_TCP_PORT 4242
+#endif
+
+typedef struct
+{
     CPXRoutingPacked_t route;
     uint8_t data[WIFI_TRANSPORT_MTU - CPX_ROUTING_PACKED_SIZE];
 } __attribute__((packed)) WifiTransportPayload_t;
 
-typedef struct {
+typedef struct
+{
     uint16_t payloadLength;
-    union {
+    union
+    {
         WifiTransportPayload_t routablePayload;
         uint8_t payload[WIFI_TRANSPORT_MTU];
     };
 } __attribute__((packed)) WifiTransportPacket_t;
 
-
 void wifi_init();
 
 // Interface used by the router
-void wifi_transport_send(const CPXRoutablePacket_t* packet);
-void wifi_transport_receive(CPXRoutablePacket_t* packet);
+void wifi_transport_send(const CPXRoutablePacket_t *packet);
+void wifi_transport_receive(CPXRoutablePacket_t *packet);
+
+// Interface PEER (4242) used by the router
+void wifi_peer_transport_send(const CPXRoutablePacket_t *packet);
+void wifi_peer_transport_receive(CPXRoutablePacket_t *packet);
