@@ -1,22 +1,8 @@
 /*
- * Copyright 2019 GreenWaves Technologies, SAS
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * (tue licenze/origine)
  */
 
 #include "stdio.h"
-
-
 /* PMSIS includes */
 #include "pmsis.h"
 #include "bsp/buffer.h"
@@ -26,20 +12,21 @@
 #include "bsp/buffer.h"
 #include "bsp/ai_deck.h"
 #include "bsp/camera/himax.h"
+#include "FreeRTOS.h"
 
 /* Gaplib includes */
 // #include "gaplib/ImgIO.h"
 
-#if defined(USE_STREAMER)
 #include "cpx.h"
 #include "wifi.h"
-#endif /* USE_STREAMER */
 
 // All includes for facedetector application
 #include "faceDet.h"
 #include "FaceDetKernels.h"
 #include "ImageDraw.h"
 #include "setup.h"
+#include <stdint.h>
+#include <stdbool.h>
 
 #define CAM_WIDTH 324
 #define CAM_HEIGHT 244
@@ -51,41 +38,135 @@
 static EventGroupHandle_t evGroup;
 #define CAPTURE_DONE_BIT (1 << 0)
 
+#define MY_DRONE_ID 1
+
+// --- NEW --- peer (drone-2) IP/porta e opcodes controllo
+#define PEER_IP_BE ((uint32_t)0x0A000066) // 10.0.0.102 in big-endian
+#define PEER_PORT_BE ((uint16_t)0x1092)   // htons(4242)
+
+// --- NEW --- finestra minima tra due alert (ms) e timeout salita link
+#define ALERT_COOLDOWN_MS 10000u
+#define PEER_UP_TIMEOUT_MS 2000u
+
 // Performance menasuring variables
 static uint32_t start = 0;
 static uint32_t captureTime = 0;
 static uint32_t transferTime = 0;
 static uint32_t encodingTime = 0;
-// #define OUTPUT_PROFILING_DATA
 
 static int wifiConnected = 0;
 static int wifiClientConnected = 0;
+static int wifiPeerConnected = 0;
+static int peerAckSeen = 0;
 
 static pi_task_t task1;
 
+static CPXPacket_t txp;
 static CPXPacket_t rxp;
+static CPXPacket_t rxp2;
+
+// --- NEW --- util tempo (ms)
+static inline uint32_t now_ms(void)
+{
+  return pi_time_get_us() / 1000u;
+}
+
+// --- Message types standardizzati ---
+typedef enum
+{
+  MSG_TYPE_ALERT = 0,
+  MSG_TYPE_ACK,
+  MSG_TYPE_CMD_RESPONSE
+} MsgType_t;
+
+// Mappa enum -> stringa
+static const char *msgTypeToStr(MsgType_t type)
+{
+  switch (type)
+  {
+  case MSG_TYPE_ALERT:
+    return "alert";
+  case MSG_TYPE_ACK:
+    return "ack";
+  case MSG_TYPE_CMD_RESPONSE:
+    return "cmd_response";
+  default:
+    return "unknown";
+  }
+}
+
+// Helper JSON unica (NO varargs)
+static void sendJsonMsg(CPXPacket_t *packet, MsgType_t type, const char *message, int count)
+{
+  char msg[128];
+  int len;
+
+  if (count >= 0)
+  {
+    len = snprintf(msg, sizeof(msg),
+                   "{\"drone_id\":\"drone-%d\",\"type\":\"%s\",\"message\":\"%s\",\"count\":%d}\n",
+                   MY_DRONE_ID, msgTypeToStr(type), message, count);
+  }
+  else
+  {
+    len = snprintf(msg, sizeof(msg),
+                   "{\"drone_id\":\"drone-%d\",\"type\":\"%s\",\"message\":\"%s\"}\n",
+                   MY_DRONE_ID, msgTypeToStr(type), message);
+  }
+
+  if (len < 0)
+  {
+    cpxPrintToConsole(LOG_TO_CRTP, "JSON format error\n");
+    return;
+  }
+  if (len > (int)sizeof(packet->data))
+  {
+    cpxPrintToConsole(LOG_TO_CRTP, "JSON truncated: %d > %u\n", len, (unsigned)sizeof(packet->data));
+    len = sizeof(packet->data);
+  }
+
+  memcpy(packet->data, msg, len);
+  packet->dataLength = (uint16_t)len;
+
+  cpxSendPacketBlocking(packet);
+  cpxPrintToConsole(LOG_TO_CRTP, "[GAP8->APP] sent: %s", msg);
+}
+
 void rx_task(void *parameters)
 {
   while (1)
   {
-    cpxReceivePacketBlocking(CPX_F_WIFI_CTRL, &rxp);
 
-    WiFiCTRLPacket_t * wifiCtrl = (WiFiCTRLPacket_t*) rxp.data;
+    cpxReceivePacketBlocking(CPX_F_WIFI_CTRL, &rxp); // Blocca fino a ricezione
+    WiFiCTRLPacket_t *wifiCtrl = (WiFiCTRLPacket_t *)rxp.data;
 
     switch (wifiCtrl->cmd)
     {
-      case WIFI_CTRL_STATUS_WIFI_CONNECTED:
-        cpxPrintToConsole(LOG_TO_CRTP, "Wifi connected (%u.%u.%u.%u)\n",
-                          wifiCtrl->data[0], wifiCtrl->data[1],
-                          wifiCtrl->data[2], wifiCtrl->data[3]);
-        wifiConnected = 1;
-        break;
-      case WIFI_CTRL_STATUS_CLIENT_CONNECTED:
-        cpxPrintToConsole(LOG_TO_CRTP, "Wifi client connection status: %u\n", wifiCtrl->data[0]);
-        wifiClientConnected = wifiCtrl->data[0];
-        break;
-      default:
-        break;
+    case WIFI_CTRL_STATUS_WIFI_CONNECTED:
+      cpxPrintToConsole(LOG_TO_CRTP, "WiFi connected (%u.%u.%u.%u)\n", wifiCtrl->data[0], wifiCtrl->data[1], wifiCtrl->data[2], wifiCtrl->data[3]);
+      wifiConnected = 1;
+      break;
+    case WIFI_CTRL_STATUS_CLIENT_CONNECTED:
+      cpxPrintToConsole(LOG_TO_CRTP, "Wifi client connection status: %u\n", wifiCtrl->data[0]);
+      wifiClientConnected = wifiCtrl->data[0];
+      break;
+    case WIFI_CTRL_PEER_STATUS:
+    { // drone-to-drone connection status
+      uint8_t st = wifiCtrl->data[0];
+      wifiPeerConnected = (st == 1);
+      if (st == 2)
+      {
+        cpxPrintToConsole(LOG_TO_CRTP, "Wifi peer status: %u (busy)\n", st);
+      }
+      else
+      {
+        cpxPrintToConsole(LOG_TO_CRTP, "Wifi peer status: %u\n", st);
+      }
+      break;
+    }
+    default:
+      cpxPrintToConsole(LOG_TO_CRTP, "Unknown wifi command: %u\n", wifiCtrl->data[0]);
+      break;
     }
   }
 }
@@ -105,7 +186,6 @@ typedef struct
   uint32_t size;
 } __attribute__((packed)) img_header_t;
 
-
 typedef enum
 {
   RAW_ENCODING = 0,
@@ -121,10 +201,9 @@ uint32_t jpegSize;
 
 static StreamerMode_t streamerMode = RAW_ENCODING;
 
-static CPXPacket_t txp;
-
-void createImageHeaderPacket(CPXPacket_t * packet, uint32_t imgSize, StreamerMode_t imgType) {
-  img_header_t *imgHeader = (img_header_t *) packet->data;
+void createImageHeaderPacket(CPXPacket_t *packet, uint32_t imgSize, StreamerMode_t imgType)
+{
+  img_header_t *imgHeader = (img_header_t *)packet->data;
   imgHeader->magic = 0xBC;
   imgHeader->width = CAM_WIDTH;
   imgHeader->height = CAM_HEIGHT;
@@ -134,10 +213,12 @@ void createImageHeaderPacket(CPXPacket_t * packet, uint32_t imgSize, StreamerMod
   packet->dataLength = sizeof(img_header_t);
 }
 
-void sendBufferViaCPX(CPXPacket_t * packet, uint8_t * buffer, uint32_t bufferSize) {
+void sendBufferViaCPX(CPXPacket_t *packet, uint8_t *buffer, uint32_t bufferSize)
+{
   uint32_t offset = 0;
   uint32_t size = 0;
-  do {
+  do
+  {
     size = sizeof(packet->data);
     if (offset + size > bufferSize)
     {
@@ -149,29 +230,6 @@ void sendBufferViaCPX(CPXPacket_t * packet, uint8_t * buffer, uint32_t bufferSiz
     offset += size;
   } while (size == sizeof(packet->data));
 }
-
-#ifdef SETUP_WIFI_AP
-void setupWiFi(void) {
-  static char ssid[] = "WiFi streaming example";
-  cpxPrintToConsole(LOG_TO_CRTP, "Setting up WiFi AP\n");
-  // Set up the routing for the WiFi CTRL packets
-  txp.route.destination = CPX_T_ESP32;
-  rxp.route.source = CPX_T_GAP8;
-  txp.route.function = CPX_F_WIFI_CTRL;
-  txp.route.version = CPX_VERSION;
-  WiFiCTRLPacket_t * wifiCtrl = (WiFiCTRLPacket_t*) txp.data;
-
-  wifiCtrl->cmd = WIFI_CTRL_SET_SSID;
-  memcpy(wifiCtrl->data, ssid, sizeof(ssid));
-  txp.dataLength = sizeof(ssid);
-  cpxSendPacketBlocking(&txp);
-
-  wifiCtrl->cmd = WIFI_CTRL_WIFI_CONNECT;
-  wifiCtrl->data[0] = 0x01;
-  txp.dataLength = 2;
-  cpxSendPacketBlocking(&txp);
-}
-#endif
 
 // Intializing buffers for camera images
 static unsigned char *imgBuff0;
@@ -205,14 +263,14 @@ static int open_camera_himax(struct pi_device *device)
   if (pi_camera_open(device))
     return -1;
 
-    // rotate image
+  // rotate image
   pi_camera_control(device, PI_CAMERA_CMD_START, 0);
-  uint8_t set_value=3;
+  uint8_t set_value = 3;
   uint8_t reg_value;
   pi_camera_reg_set(device, IMG_ORIENTATION, &set_value);
   pi_time_wait_us(1000000);
   pi_camera_reg_get(device, IMG_ORIENTATION, &reg_value);
-  if (set_value!=reg_value)
+  if (set_value != reg_value)
   {
     cpxPrintToConsole(LOG_TO_CRTP, "Failed to rotate camera image\n");
     return -1;
@@ -223,49 +281,26 @@ static int open_camera_himax(struct pi_device *device)
   return 0;
 }
 
-
 static int open_camera(struct pi_device *device)
 {
   return open_camera_himax(device);
 }
 
-//UART init param
+// UART init param
 L2_MEM struct pi_uart_conf uart_conf;
 L2_MEM struct pi_device uart;
 L2_MEM uint8_t rec_digit = -1;
 
-
-// Functions and init for LED toggle
-static pi_task_t led_task;
-static int led_val = 0;
-static struct pi_device gpio_device;
-static void led_handle(void *arg)
+void facedetection_task(void *parameters)
 {
-  pi_gpio_pin_write(&gpio_device, 2, led_val);
-  led_val ^= 1;
-  pi_task_push_delayed_us(pi_task_callback(&led_task, led_handle, NULL), 500000);
-}
-
-
-
-void facedetection_task(void)
-{
-    vTaskDelay(2000);
-    cpxInitRoute(CPX_T_GAP8, CPX_T_WIFI_HOST, CPX_F_APP, &txp.route);
-    cpxPrintToConsole(LOG_TO_CRTP, "Starting face detection task...\n");
-
-
-#ifdef SETUP_WIFI_AP
-  setupWiFi();
-#endif
+  vTaskDelay(2000);
+  cpxInitRoute(CPX_T_GAP8, CPX_T_WIFI_HOST, CPX_F_APP, &txp.route);
+  cpxPrintToConsole(LOG_TO_CRTP, "Starting face detection task...\n");
 
   unsigned int W = CAM_WIDTH, H = CAM_HEIGHT;
   unsigned int Wout = 64, Hout = 48;
   unsigned int ImgSize = W * H;
 
-  // Start LED toggle
-  pi_gpio_pin_configure(&gpio_device, 2, PI_GPIO_OUTPUT);
-  pi_task_push_delayed_us(pi_task_callback(&led_task, led_handle, NULL), 500000);
   imgBuff0 = (unsigned char *)pmsis_l2_malloc((CAM_WIDTH * CAM_HEIGHT) * sizeof(unsigned char));
   if (imgBuff0 == NULL)
   {
@@ -287,7 +322,6 @@ void facedetection_task(void)
     cpxPrintToConsole(LOG_TO_CRTP, "Failed to allocate Memory for one or both Integral Images (%d bytes)\n", ImgSize * sizeof(unsigned int));
     pmsis_exit(-3);
   }
-  // printf("malloc done\n");
 
   if (open_camera(&cam))
   {
@@ -336,7 +370,6 @@ void facedetection_task(void)
   pi_open_from_conf(&cluster_dev, (void *)&conf);
   pi_cluster_open(&cluster_dev);
 
-  //Set Cluster Frequency to 75MHz - max (175000000) leads to more camera failures (unknown why)
   pi_freq_set(PI_FREQ_DOMAIN_CL, 75000000);
 
   // Send intializer function to cluster
@@ -350,46 +383,104 @@ void facedetection_task(void)
   task->entry = (void *)faceDet_cluster_main;
   task->arg = &ClusterCall;
 
-  // printf("main loop start\n");
-
-  // Start looping through images
   int nb_frames = 0;
   EventBits_t evBits;
   pi_camera_control(&cam, PI_CAMERA_CMD_STOP, 0);
+
+  // --- NEW --- throttling alert
+  uint32_t lastAlertMs = 0;
 
   while (1 && (NB_FRAMES == -1 || nb_frames < NB_FRAMES))
   {
     // Capture image
     pi_camera_capture_async(&cam, imgBuff0, CAM_WIDTH * CAM_HEIGHT, pi_task_callback(&task1, capture_done_cb, NULL));
     pi_camera_control(&cam, PI_CAMERA_CMD_START, 0);
-    // it should really not take longer than 500ms to acquire an image, maybe we could even time out earlier
-    evBits = xEventGroupWaitBits(evGroup, CAPTURE_DONE_BIT, pdTRUE, pdFALSE, (TickType_t)(500/portTICK_PERIOD_MS));
+    evBits = xEventGroupWaitBits(evGroup, CAPTURE_DONE_BIT, pdTRUE, pdFALSE, (TickType_t)(500 / portTICK_PERIOD_MS));
     pi_camera_control(&cam, PI_CAMERA_CMD_STOP, 0);
-    // if we didn't succeed in capturing the image (which, especially with high cluster frequencies and dark images can happen) we want to retry
-    while((evBits & CAPTURE_DONE_BIT) != CAPTURE_DONE_BIT)
+    while ((evBits & CAPTURE_DONE_BIT) != CAPTURE_DONE_BIT)
     {
       cpxPrintToConsole(LOG_TO_CRTP, "Failed camera acquisition\n");
       pi_camera_control(&cam, PI_CAMERA_CMD_START, 0);
-      evBits = xEventGroupWaitBits(evGroup, CAPTURE_DONE_BIT, pdTRUE, pdFALSE, (TickType_t)(500/portTICK_PERIOD_MS));
+      evBits = xEventGroupWaitBits(evGroup, CAPTURE_DONE_BIT, pdTRUE, pdFALSE, (TickType_t)(500 / portTICK_PERIOD_MS));
       pi_camera_control(&cam, PI_CAMERA_CMD_STOP, 0);
     }
 
-    // Send task to the cluster and print response
+    // Run detection
     pi_cluster_send_task_to_cl(&cluster_dev, task);
-    // cpxPrintToConsole(LOG_TO_CRTP, "end of face detection, faces detected: %d\n", ClusterCall.num_response);
 
-#if defined(USE_STREAMER)
-    if (wifiClientConnected == 1)
-    {
-      // First send information about the image
-      createImageHeaderPacket(&txp, STREAM_W*STREAM_H, RAW_ENCODING);
-      cpxSendPacketBlocking(&txp);
-      // Send image
-      sendBufferViaCPX(&txp, ImageOut, STREAM_W*STREAM_H);
-    }
-#endif
-    // Send result through the uart to the crazyflie as single characters
-    pi_uart_write(&uart, &ClusterCall.num_response, 1);
+    /**
+     *     // --- MOD --- invio: oltre all'HOST, aggiungiamo il canale DRONE (con cooldown e connect/close)
+        if (ClusterCall.num_reponse > 0)
+        {
+          // (a) invio verso PC host come prima, se collegato
+          if (wifiClientConnected == 1)
+          {
+            sendJsonMsg(&txp, MSG_TYPE_ALERT, "face detected", ClusterCall.num_reponse);
+          }
+
+          // (b) invio verso DRONE-2 con rate-limit 10s
+          uint32_t now = now_ms();
+          if (lastAlertMs == 0 || (now - lastAlertMs) >= ALERT_COOLDOWN_MS)
+          {
+            // i) chiedi apertura connessione peer
+            CPXPacket_t txCtrl = (CPXPacket_t){0}; // controllo
+            cpxInitRoute(CPX_T_GAP8, CPX_T_ESP32, CPX_F_WIFI_CTRL, &txCtrl.route);
+            txCtrl.data[0] = WIFI_CTRL_PEER_CONNECT;
+            uint32_t ip_be = PEER_IP_BE;
+            uint16_t port_be = PEER_PORT_BE;
+            memcpy(&txCtrl.data[1], &ip_be, 4);
+            memcpy(&txCtrl.data[5], &port_be, 2);
+            txCtrl.dataLength = 1 + 4 + 2;
+            cpxSendPacketBlocking(&txCtrl);
+
+            // ii) attendi link UP (fino a 2s)
+            uint32_t deadline = now_ms() + PEER_UP_TIMEOUT_MS;
+            while (!wifiPeerConnected && now_ms() < deadline)
+            {
+              vTaskDelay(1);
+            }
+
+            if (wifiPeerConnected)
+            {
+              // iii) prepara pacchetto dati verso PEER
+              CPXPacket_t txPeer = (CPXPacket_t){0};
+    #ifndef CPX_T_WIFI_PEER
+    #define CPX_T_WIFI_PEER ((CPXTarget_t)5) // A remote computer connected via Wifi peer-to-peer
+    #endif
+
+              cpxInitRoute(CPX_T_GAP8, CPX_T_WIFI_PEER, CPX_F_APP, &txPeer.route);
+              sendJsonMsg(&txPeer, MSG_TYPE_ALERT, "face detected", ClusterCall.num_reponse);
+
+              peerAckSeen = 0;
+              uint32_t ackDeadline = now_ms() + 500;
+              while (!peerAckSeen && now_ms() < ackDeadline)
+              {
+                vTaskDelay(1);
+              }
+              if (!peerAckSeen)
+              {
+                cpxPrintToConsole(LOG_TO_CRTP, "Warning: no ACK received from peer! (timeout)\n");
+              }
+
+              // iv) chiudi la sessione per liberare il peer
+              CPXPacket_t txClose = (CPXPacket_t){0};
+              cpxInitRoute(CPX_T_GAP8, CPX_T_ESP32, CPX_F_WIFI_CTRL, &txClose.route);
+              txClose.data[0] = WIFI_CTRL_PEER_CLOSE;
+              txClose.dataLength = 1;
+              cpxSendPacketBlocking(&txClose);
+
+              lastAlertMs = now_ms();
+            }
+            else
+            {
+              cpxPrintToConsole(LOG_TO_CRTP, "Peer not UP: skipped peer alert\n");
+            }
+          }
+        }
+
+     */
+    // Manda il numero di facce via UART (come prima)
+    pi_uart_write(&uart, &ClusterCall.num_reponse, 1);
 
     nb_frames++;
   }
@@ -397,24 +488,91 @@ void facedetection_task(void)
   pmsis_exit(0);
 }
 
-#define LED_PIN 2
-static pi_device_t led_gpio_dev;
-void hb_task(void *parameters)
+static int parseType(const char *json, const char *typeToCheck)
 {
-  (void)parameters;
-  char *taskname = pcTaskGetName(NULL);
+  const char *p = json;
 
-  // Initialize the LED pin
-  pi_gpio_pin_configure(&led_gpio_dev, LED_PIN, PI_GPIO_OUTPUT);
+  while (*p)
+  {
+    // cerca la sottostringa "type"
+    if (p[0] == '"' && p[1] == 't' && p[2] == 'y' && p[3] == 'p' && p[4] == 'e' && p[5] == '"')
+    {
+      // cerca i due punti
+      const char *colon = strchr(p, ':');
+      if (colon)
+      {
+        // cerca la prima doppia virgoletta dopo il :
+        const char *start = strchr(colon, '"');
+        if (start)
+        {
+          start++; // subito dopo il "
+          const char *end = strchr(start, '"');
+          if (end)
+          {
+            int len = end - start;
+            if (strncmp(start, typeToCheck, len) == 0 && typeToCheck[len] == '\0')
+            {
+              return 1; // trovato type uguale
+            }
+          }
+        }
+      }
+    }
+    p++;
+  }
+  return 0; // non trovato
+}
 
-  const TickType_t xDelay = 500 / portTICK_PERIOD_MS;
+void rx_client_msg(void *parameters)
+{
+  cpxEnableFunction(CPX_F_APP);
+  cpxPrintToConsole(LOG_TO_CRTP, "Starting client message receiver\n");
+
+  static CPXPacket_t rx;
+  static CPXPacket_t tx; // per la risposta ACK
+
+  // --- MOD --- la route di risposta verrà decisa in base al mittente (HOST o PEER)
+  // cpxInitRoute(CPX_T_GAP8, CPX_T_WIFI_HOST, CPX_F_APP, &tx.route);
 
   while (1)
   {
-    pi_gpio_pin_write(&led_gpio_dev, LED_PIN, 1);
-    vTaskDelay(xDelay);
-    pi_gpio_pin_write(&led_gpio_dev, LED_PIN, 0);
-    vTaskDelay(xDelay);
+    // 1) ricezione bloccante
+    cpxReceivePacketBlocking(CPX_F_APP, &rx);
+
+    // 2) log del payload ricevuto (safe string)
+    char buf[257];
+    int copy_len = (rx.dataLength < 256) ? rx.dataLength : 256;
+    memcpy(buf, rx.data, copy_len);
+    buf[copy_len] = '\0';
+    cpxPrintToConsole(LOG_TO_CRTP, "[APP->GAP8] msg: %s\n", buf);
+
+    // se arriva un ACK dal peer, segno la bandierina
+
+    if (rx.route.source != CPX_T_WIFI_HOST)
+    {
+
+      if (parseType(buf, "ack"))
+      {
+        peerAckSeen = 1;
+        cpxPrintToConsole(LOG_TO_CRTP, "Ricevuto ACK! (no reply)\n");
+        continue; // non rispondo all'ACK del peer
+      }
+    }
+
+    // 3) (opzionale) risposta ACK: se vuoi rispondere, mandala sul canale giusto
+    //    - da PC:      source tipico HOST -> rispondi a WIFI_HOST
+    //    - da DRONE:   arriva via ESP32/peer -> rispondi a WIFI_PEER
+    memset(&tx, 0, sizeof(tx));
+    if (rx.route.source == CPX_T_WIFI_HOST)
+    {
+      cpxInitRoute(CPX_T_GAP8, CPX_T_WIFI_HOST, CPX_F_APP, &tx.route);
+      sendJsonMsg(&tx, MSG_TYPE_ACK, "messaggio ricevuto (host)", -1);
+    }
+    else
+    {
+      cpxInitRoute(CPX_T_GAP8, CPX_T_WIFI_PEER, CPX_F_APP, &tx.route);
+      sendJsonMsg(&tx, MSG_TYPE_ACK, "messaggio ricevuto (peer)", -1);
+    }
   }
 }
 
@@ -422,39 +580,39 @@ void start_example(void)
 {
   cpxInit();
   cpxEnableFunction(CPX_F_WIFI_CTRL);
-
-  cpxPrintToConsole(LOG_TO_CRTP, "-- WiFi image streamer example --\n");
+  cpxPrintToConsole(LOG_TO_CRTP, "-- WiFi Face Detection started --\n");
 
   evGroup = xEventGroupCreate();
 
   BaseType_t xTask;
 
-  xTask = xTaskCreate(hb_task, "hb_task", configMINIMAL_STACK_SIZE * 2,
-                      NULL, tskIDLE_PRIORITY + 1, NULL);
-  if (xTask != pdPASS)
-  {
-    cpxPrintToConsole(LOG_TO_CRTP, "HB task did not start !\n");
-    pmsis_exit(-1);
-  }
-
-  xTask = xTaskCreate(facedetection_task, "facedetection_task", configMINIMAL_STACK_SIZE * 4,
-                      NULL, tskIDLE_PRIORITY + 1, NULL);
-
-  if (xTask != pdPASS)
-  {
-    cpxPrintToConsole(LOG_TO_CRTP, "Camera task did not start !\n");
-    pmsis_exit(-1);
-  }
-
   xTask = xTaskCreate(rx_task, "rx_task", configMINIMAL_STACK_SIZE * 2,
                       NULL, tskIDLE_PRIORITY + 1, NULL);
-
   if (xTask != pdPASS)
   {
-    cpxPrintToConsole(LOG_TO_CRTP, "RX task did not start !\n");
+    cpxPrintToConsole(LOG_TO_CRTP, "RX task did not start!\n");
     pmsis_exit(-1);
   }
 
+  xTask = xTaskCreate(rx_client_msg, "rx_client_msg", configMINIMAL_STACK_SIZE * 2,
+                      NULL, tskIDLE_PRIORITY + 1, NULL);
+  if (xTask != pdPASS)
+  {
+    cpxPrintToConsole(LOG_TO_CRTP, "rx_client_msg task did not start!\n");
+    pmsis_exit(-1);
+  }
+  /**
+   *
+    xTask = xTaskCreate(facedetection_task, "facedetection_task", configMINIMAL_STACK_SIZE * 4,
+                        NULL, tskIDLE_PRIORITY + 1, NULL);
+
+    if (xTask != pdPASS)
+    {
+      cpxPrintToConsole(LOG_TO_CRTP, "Camera task did not start !\n");
+      pmsis_exit(-1);
+    }
+
+   */
   while (1)
   {
     pi_yield();
