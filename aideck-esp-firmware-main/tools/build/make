@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -e
+
+scriptDir=$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )
+
+source /new_home/.espressif/python_env/idf4.3_py3.10_env/bin/activate && make --directory=${scriptDir}/../.. "${@}"
