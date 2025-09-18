@@ -31,14 +31,17 @@
 #define CPX_HEADER_SIZE (2)
 
 // This enum is used to identify source and destination for CPX routing information
-typedef enum {
-  CPX_T_STM32 = 1, // The STM in the Crazyflie
-  CPX_T_ESP32 = 2, // The ESP on the AI-deck
-  CPX_T_WIFI_HOST = 3,  // A remote computer connected via Wifi
-  CPX_T_GAP8 = 4   // The GAP8 on the AI-deck
+typedef enum
+{
+  CPX_T_STM32 = 1,     // The STM in the Crazyflie
+  CPX_T_ESP32 = 2,     // The ESP on the AI-deck
+  CPX_T_WIFI_HOST = 3, // A remote computer connected via Wifi
+  CPX_T_GAP8 = 4,      // The GAP8 on the AI-deck
+  CPX_T_WIFI_PEER = 5  // A peer AI-deck connected via Wifi
 } CPXTarget_t;
 
-typedef enum {
+typedef enum
+{
   CPX_F_SYSTEM = 1,
   CPX_F_CONSOLE = 2,
   CPX_F_CRTP = 3,
@@ -49,7 +52,8 @@ typedef enum {
   CPX_F_LAST // NEEDS TO BE LAST
 } CPXFunction_t;
 
-typedef struct {
+typedef struct
+{
   CPXTarget_t destination;
   CPXTarget_t source;
   bool lastPacket;
@@ -57,13 +61,15 @@ typedef struct {
   uint8_t version;
 } CPXRouting_t;
 
-typedef struct {
+typedef struct
+{
   CPXRouting_t route;
   uint16_t dataLength;
-  uint8_t data[MTU-CPX_HEADER_SIZE];
+  uint8_t data[MTU - CPX_HEADER_SIZE];
 } CPXPacket_t;
 
-typedef enum {
+typedef enum
+{
   LOG_TO_WIFI = CPX_T_WIFI_HOST,
   LOG_TO_CRTP = CPX_T_STM32
 } CPXConsoleTarget_t;
@@ -83,7 +89,7 @@ void cpxInit(void);
  * @param function function to receive packet on
  * @param packet received packet will be stored here
  */
-void cpxReceivePacketBlocking(CPXFunction_t function, CPXPacket_t * packet);
+void cpxReceivePacketBlocking(CPXFunction_t function, CPXPacket_t *packet);
 
 /**
  * @brief Enable receiving on queue
@@ -93,7 +99,7 @@ void cpxReceivePacketBlocking(CPXFunction_t function, CPXPacket_t * packet);
  *
  * @param function packet to be sent
  */
-void cpxEnableFunction( CPXFunction_t function);
+void cpxEnableFunction(CPXFunction_t function);
 
 /**
  * @brief Send a CPX packet to the ESP32
@@ -103,7 +109,7 @@ void cpxEnableFunction( CPXFunction_t function);
  *
  * @param packet packet to be sent
  */
-void cpxSendPacketBlocking(const CPXPacket_t * packet);
+void cpxSendPacketBlocking(const CPXPacket_t *packet);
 
 /**
  * @brief Send a CPX packet to the ESP32
@@ -115,7 +121,7 @@ void cpxSendPacketBlocking(const CPXPacket_t * packet);
  * @return true if package could be queued for sending
  * @return false if package could not be queued for sending within timeout
  */
-bool cpxSendPacket(const CPXPacket_t * packet, uint32_t timeout);
+bool cpxSendPacket(const CPXPacket_t *packet, uint32_t timeout);
 
 /**
  * @brief Initialize CPX routing data.
@@ -127,7 +133,7 @@ bool cpxSendPacket(const CPXPacket_t * packet, uint32_t timeout);
  * @param function The function of the content
  * @param route Pointer to the route data to initialize
  */
-void cpxInitRoute(const CPXTarget_t source, const CPXTarget_t destination, const CPXFunction_t function, CPXRouting_t* route);
+void cpxInitRoute(const CPXTarget_t source, const CPXTarget_t destination, const CPXFunction_t function, CPXRouting_t *route);
 
 /**
  * @brief Print debug data though CPX
@@ -139,4 +145,4 @@ void cpxInitRoute(const CPXTarget_t source, const CPXTarget_t destination, const
  * @param fmt Standard C format string
  * @param variable Data for format string
  */
-void cpxPrintToConsole(CPXConsoleTarget_t target, const char * fmt, ...);
+void cpxPrintToConsole(CPXConsoleTarget_t target, const char *fmt, ...);

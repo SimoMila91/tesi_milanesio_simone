@@ -20,6 +20,13 @@
 #include "cpx.h"
 #include "wifi.h"
 
+// --- compat: definisci CPX_T_WIFI_PEER se la tua cpx.h è vecchia ---
+// === compat fallback ===
+#ifndef CPX_T_WIFI_PEER
+#define CPX_T_WIFI_PEER ((CPXTarget_t)5)
+#endif
+// === fine compat ===
+
 // All includes for facedetector application
 #include "faceDet.h"
 #include "FaceDetKernels.h"
@@ -27,6 +34,7 @@
 #include "setup.h"
 #include <stdint.h>
 #include <stdbool.h>
+#include <string.h>
 
 #define CAM_WIDTH 324
 #define CAM_HEIGHT 244
@@ -40,35 +48,34 @@ static EventGroupHandle_t evGroup;
 
 #define MY_DRONE_ID 2
 
-// --- NEW --- peer (drone-2) IP/porta e opcodes controllo
-#define PEER_IP_BE ((uint32_t)0x0A000065) // 10.0.0.101 in big-endian
+// IP/porta del peer (drone-1) in big-endian
+#define PEER_IP_BE ((uint32_t)0x0A000065) // 10.0.0.101
 #define PEER_PORT_BE ((uint16_t)0x1092)   // htons(4242)
 
-// --- NEW --- finestra minima tra due alert (ms) e timeout salita link
-// #define ALERT_COOLDOWN_MS 10000u
-// #define PEER_UP_TIMEOUT_MS 2000u
+#define NO_FACE_IDLE_MS 10000u
+#define PEER_CONNECT_RETRY_MS 500u
 
-#define NO_FACE_IDLE_MS 10000u     // chiudi se per 10s non vedi facce
-#define PEER_CONNECT_RETRY_MS 500u // non spammare CONNECT ogni frame
-
-// Performance menasuring variables
+// Performance menasuring variables (non usati nella demo)
 static uint32_t start = 0;
 static uint32_t captureTime = 0;
 static uint32_t transferTime = 0;
 static uint32_t encodingTime = 0;
 
+// === flag condivisi tra task: meglio volatile ===
 static int wifiConnected = 0;
 static int wifiClientConnected = 0;
 static int wifiPeerConnected = 0;
+static int wifiPeerBusy = 0; // === nuovo: stato busy
+static int peerAckSeen = 0;
+// === fine flag ===
+
 static uint32_t lastFaceMs = 0;
 static uint32_t lastPeerConnectTryMs = 0;
-static int peerAckSeen = 0;
 
 static pi_task_t task1;
 
 static CPXPacket_t txp;
 static CPXPacket_t rxp;
-static CPXPacket_t rxp2;
 
 // --- Message types standardizzati ---
 typedef enum
@@ -108,7 +115,7 @@ static inline void write_be32(uint8_t *dst, uint32_t v)
   dst[3] = (uint8_t)(v);
 }
 
-// Helper JSON unica (NO varargs)
+// Helper JSON unica
 static void sendJsonMsg(CPXPacket_t *packet, MsgType_t type, const char *message, int count)
 {
   char msg[128];
@@ -134,7 +141,6 @@ static void sendJsonMsg(CPXPacket_t *packet, MsgType_t type, const char *message
   }
   if (len > (int)sizeof(packet->data))
   {
-    cpxPrintToConsole(LOG_TO_CRTP, "JSON truncated: %d > %u\n", len, (unsigned)sizeof(packet->data));
     len = sizeof(packet->data);
   }
 
@@ -147,40 +153,52 @@ static void sendJsonMsg(CPXPacket_t *packet, MsgType_t type, const char *message
 
 static inline uint32_t now_ms(void) { return pi_time_get_us() / 1000u; }
 
+// === task: tentativi di connect + heartbeat al peer, con throttle ===
 static void peer_periodic_msg_task(void *parameters)
 {
   cpxPrintToConsole(LOG_TO_CRTP, "[peer] starting periodic msg task\n");
   uint32_t lastTryMs = 0;
+  uint32_t lastHelloMs = 0; // === nuovo: throttle heartbeat
 
   while (1)
   {
     if (!wifiPeerConnected)
     {
-      uint32_t now = pi_time_get_us() / 1000u;
-      if (now - lastTryMs >= 5000) // retry ogni 5s
+      // se ESP segnala busy, non spammare CONNECT
+      if (!wifiPeerBusy)
       {
-        CPXPacket_t txCtrl = {0};
-        cpxInitRoute(CPX_T_GAP8, CPX_T_ESP32, CPX_F_WIFI_CTRL, &txCtrl.route);
-        txCtrl.data[0] = WIFI_CTRL_PEER_CONNECT;
-        write_be32(&txCtrl.data[1], PEER_IP_BE);
-        write_be16(&txCtrl.data[5], PEER_PORT_BE);
-        txCtrl.dataLength = 1 + 4 + 2;
-        cpxSendPacketBlocking(&txCtrl);
-        cpxPrintToConsole(LOG_TO_CRTP, "[peer] CONNECT sent to %u.%u.%u.%u:4242\n",
-                          (unsigned)((PEER_IP_BE >> 24) & 0xFF), (unsigned)((PEER_IP_BE >> 16) & 0xFF),
-                          (unsigned)((PEER_IP_BE >> 8) & 0xFF), (unsigned)(PEER_IP_BE & 0xFF));
-        lastTryMs = now;
+        uint32_t now = now_ms();
+        if (now - lastTryMs >= 5000) // retry ogni 5s
+        {
+          CPXPacket_t txCtrl = (CPXPacket_t){0};
+          cpxInitRoute(CPX_T_GAP8, CPX_T_ESP32, CPX_F_WIFI_CTRL, &txCtrl.route);
+          txCtrl.data[0] = WIFI_CTRL_PEER_CONNECT;
+          write_be32(&txCtrl.data[1], PEER_IP_BE);
+          write_be16(&txCtrl.data[5], PEER_PORT_BE);
+          txCtrl.dataLength = 1 + 4 + 2;
+          cpxSendPacketBlocking(&txCtrl);
+          cpxPrintToConsole(LOG_TO_CRTP, "[peer] CONNECT sent to %u.%u.%u.%u:4242\n",
+                            (unsigned)((PEER_IP_BE >> 24) & 0xFF), (unsigned)((PEER_IP_BE >> 16) & 0xFF),
+                            (unsigned)((PEER_IP_BE >> 8) & 0xFF), (unsigned)(PEER_IP_BE & 0xFF));
+          lastTryMs = now;
+        }
       }
     }
     else
     {
-      CPXPacket_t txPeer = {0};
-      cpxInitRoute(CPX_T_GAP8, CPX_T_WIFI_PEER, CPX_F_APP, &txPeer.route);
-      sendJsonMsg(&txPeer, MSG_TYPE_ALERT, "ciao", -1);
-      cpxPrintToConsole(LOG_TO_CRTP, "[peer] sent 'ciao' to peer\n");
+      // connesso: invia un heartbeat solo ogni 5s
+      uint32_t now = now_ms();
+      if (now - lastHelloMs >= 5000)
+      {
+        CPXPacket_t txPeer = (CPXPacket_t){0};
+        cpxInitRoute(CPX_T_GAP8, CPX_T_WIFI_PEER, CPX_F_APP, &txPeer.route);
+        sendJsonMsg(&txPeer, MSG_TYPE_ALERT, "ciao", -1);
+        cpxPrintToConsole(LOG_TO_CRTP, "[peer] sent heartbeat 'ciao'\n");
+        lastHelloMs = now;
+      }
     }
 
-    vTaskDelay(pdMS_TO_TICKS(500)); // poll veloce; retry gating è con lastTryMs
+    vTaskDelay(pdMS_TO_TICKS(200)); // poll leggero
   }
 }
 
@@ -188,7 +206,6 @@ void rx_task(void *parameters)
 {
   while (1)
   {
-
     cpxReceivePacketBlocking(CPX_F_WIFI_CTRL, &rxp); // Blocca fino a ricezione
     WiFiCTRLPacket_t *wifiCtrl = (WiFiCTRLPacket_t *)rxp.data;
 
@@ -203,21 +220,20 @@ void rx_task(void *parameters)
       wifiClientConnected = wifiCtrl->data[0];
       break;
     case WIFI_CTRL_PEER_STATUS:
-    { // drone-to-drone connection status
+    {
+      // 0=down, 1=up, 2=busy
       uint8_t st = wifiCtrl->data[0];
       wifiPeerConnected = (st == 1);
+      wifiPeerBusy = (st == 2);
       if (st == 2)
-      {
-        cpxPrintToConsole(LOG_TO_CRTP, "Wifi peer status: %u (busy)\n", st);
-      }
+        cpxPrintToConsole(LOG_TO_CRTP, "Wifi peer status: busy\n");
       else
-      {
         cpxPrintToConsole(LOG_TO_CRTP, "Wifi peer status: %u\n", st);
-      }
       break;
     }
     default:
-      cpxPrintToConsole(LOG_TO_CRTP, "Unknown wifi command: %u\n", wifiCtrl->data[0]);
+      // === fix log: stampa il cmd sconosciuto ===
+      cpxPrintToConsole(LOG_TO_CRTP, "Unknown wifi command (cmd=%u)\n", wifiCtrl->cmd);
       break;
     }
   }
@@ -273,9 +289,7 @@ void sendBufferViaCPX(CPXPacket_t *packet, uint8_t *buffer, uint32_t bufferSize)
   {
     size = sizeof(packet->data);
     if (offset + size > bufferSize)
-    {
       size = bufferSize - offset;
-    }
     memcpy(packet->data, &buffer[offset], sizeof(packet->data));
     packet->dataLength = size;
     cpxSendPacketBlocking(packet);
@@ -439,9 +453,6 @@ void facedetection_task(void *parameters)
   EventBits_t evBits;
   pi_camera_control(&cam, PI_CAMERA_CMD_STOP, 0);
 
-  // --- NEW --- throttling alert
-  uint32_t lastAlertMs = 0;
-
   while (1 && (NB_FRAMES == -1 || nb_frames < NB_FRAMES))
   {
     // Capture image
@@ -460,59 +471,79 @@ void facedetection_task(void *parameters)
     // Run detection
     pi_cluster_send_task_to_cl(&cluster_dev, task);
 
+    // TODO: (invio verso peer solo se connesso e non busy)
     /**
-     * // --- MOD --- invio: oltre all'HOST, aggiungiamo il canale DRONE (con cooldown e connect/close)
-    if (ClusterCall.num_response > 0)
-    {
-      uint32_t now = now_ms();
-      lastFaceMs = now; // aggiorna "ultimo visto"
+    *
+       if (ClusterCall.num_reponse > 0)
+       {
+         //  invio verso PC host come prima, se collegato
+         if (wifiClientConnected == 1)
+         {
+           sendJsonMsg(&txp, MSG_TYPE_ALERT, "face detected", ClusterCall.num_reponse);
+         }
 
-      // (1a) se non sono connesso al peer, prova a connetterti (throttling)
-      if (!wifiPeerConnected && (now - lastPeerConnectTryMs >= PEER_CONNECT_RETRY_MS))
-      {
-        CPXPacket_t txCtrl = {0};
-        cpxInitRoute(CPX_T_GAP8, CPX_T_ESP32, CPX_F_WIFI_CTRL, &txCtrl.route);
-        txCtrl.data[0] = WIFI_CTRL_PEER_CONNECT;
-        uint32_t ip_be = PEER_IP_BE;     // 10.0.0.101 -> 0x0A000065
-        uint16_t port_be = PEER_PORT_BE; // 4242 -> htons(4242)
-        memcpy(&txCtrl.data[1], &ip_be, 4);
-        memcpy(&txCtrl.data[5], &port_be, 2);
-        txCtrl.dataLength = 1 + 4 + 2;
-        cpxSendPacketBlocking(&txCtrl);
-        lastPeerConnectTryMs = now;
-      }
+         // invio verso DRONE-1 con rate-limit 10s
+         uint32_t now = now_ms();
+         if (lastAlertMs == 0 || (now - lastAlertMs) >= ALERT_COOLDOWN_MS)
+         {
+           //  apertura connessione peer
+           CPXPacket_t txCtrl = (CPXPacket_t){0}; // controllo
+           cpxInitRoute(CPX_T_GAP8, CPX_T_ESP32, CPX_F_WIFI_CTRL, &txCtrl.route);
+           txCtrl.data[0] = WIFI_CTRL_PEER_CONNECT;
+           uint32_t ip_be = PEER_IP_BE;
+           uint16_t port_be = PEER_PORT_BE;
+           memcpy(&txCtrl.data[1], &ip_be, 4);
+           memcpy(&txCtrl.data[5], &port_be, 2);
+           txCtrl.dataLength = 1 + 4 + 2;
+           cpxSendPacketBlocking(&txCtrl);
 
-      // (1b) se già connesso, invia SUBITO l’alert a drone-2
-      if (wifiPeerConnected)
-      {
-        CPXPacket_t txPeer = (CPXPacket_t){0};
-        cpxInitRoute(CPX_T_GAP8, CPX_T_WIFI_PEER, CPX_F_APP, &txPeer.route);
-        sendJsonMsg(&txPeer, MSG_TYPE_ALERT, "face detected", ClusterCall.num_response);
-      }
+           // attendo link UP (fino a 2s)
+           uint32_t deadline = now_ms() + PEER_UP_TIMEOUT_MS;
+           while (!wifiPeerConnected && now_ms() < deadline)
+           {
+             vTaskDelay(1);
+           }
 
-      // (1c) verso HOST (PC) – opzionale: lo lasci com’è, tanto 5000 è disattivata e non invierà
-      if (wifiClientConnected == 1)
-      {
-        sendJsonMsg(&txp, MSG_TYPE_ALERT, "face detected", ClusterCall.num_response);
-      }
-    }
+           if (wifiPeerConnected)
+           {
+             //  preparo pacchetto dati verso PEER
+             CPXPacket_t txPeer = (CPXPacket_t){0};
+   #ifndef CPX_T_WIFI_PEER
+   #define CPX_T_WIFI_PEER ((CPXTarget_t)5) // A remote computer connected via Wifi peer-to-peer
+   #endif
 
-    // (2) Se sono connesso ma non si vedono facce da 10 s -> chiudi peer
-    {
-      uint32_t now = now_ms();
-      if (wifiPeerConnected && lastFaceMs > 0 && (now - lastFaceMs >= NO_FACE_IDLE_MS))
-      {
-        CPXPacket_t txClose = {0};
-        cpxInitRoute(CPX_T_GAP8, CPX_T_ESP32, CPX_F_WIFI_CTRL, &txClose.route);
-        txClose.data[0] = WIFI_CTRL_PEER_CLOSE;
-        txClose.dataLength = 1;
-        cpxSendPacketBlocking(&txClose);
-        // lasciamo che sia l’ESP32 a mandarci WIFI_CTRL_PEER_STATUS=0
-        // (wifiPeerConnected verrà aggiornato in rx_task)
-      }
-    }
-    // Manda il numero di facce via UART (come prima)
-     */
+             cpxInitRoute(CPX_T_GAP8, CPX_T_WIFI_PEER, CPX_F_APP, &txPeer.route);
+             sendJsonMsg(&txPeer, MSG_TYPE_ALERT, "face detected", ClusterCall.num_reponse);
+
+             peerAckSeen = 0;
+             uint32_t ackDeadline = now_ms() + 500;
+             while (!peerAckSeen && now_ms() < ackDeadline)
+             {
+               vTaskDelay(1);
+             }
+             if (!peerAckSeen)
+             {
+               cpxPrintToConsole(LOG_TO_CRTP, "Warning: no ACK received from peer! (timeout)\n");
+             }
+
+             // chiudo la sessione per liberare il peer
+             CPXPacket_t txClose = (CPXPacket_t){0};
+             cpxInitRoute(CPX_T_GAP8, CPX_T_ESP32, CPX_F_WIFI_CTRL, &txClose.route);
+             txClose.data[0] = WIFI_CTRL_PEER_CLOSE;
+             txClose.dataLength = 1;
+             cpxSendPacketBlocking(&txClose);
+
+             lastAlertMs = now_ms();
+           }
+           else
+           {
+             cpxPrintToConsole(LOG_TO_CRTP, "Peer not UP: skipped peer alert\n");
+           }
+         }
+       }
+
+    */
+
     pi_uart_write(&uart, &ClusterCall.num_response, 1);
 
     nb_frames++;
@@ -527,33 +558,28 @@ static int parseType(const char *json, const char *typeToCheck)
 
   while (*p)
   {
-    // cerca la sottostringa "type"
     if (p[0] == '"' && p[1] == 't' && p[2] == 'y' && p[3] == 'p' && p[4] == 'e' && p[5] == '"')
     {
-      // cerca i due punti
       const char *colon = strchr(p, ':');
       if (colon)
       {
-        // cerca la prima doppia virgoletta dopo il :
         const char *start = strchr(colon, '"');
         if (start)
         {
-          start++; // subito dopo il "
+          start++;
           const char *end = strchr(start, '"');
           if (end)
           {
             int len = end - start;
             if (strncmp(start, typeToCheck, len) == 0 && typeToCheck[len] == '\0')
-            {
-              return 1; // trovato type uguale
-            }
+              return 1;
           }
         }
       }
     }
     p++;
   }
-  return 0; // non trovato
+  return 0;
 }
 
 void rx_client_msg(void *parameters)
@@ -564,38 +590,25 @@ void rx_client_msg(void *parameters)
   static CPXPacket_t rx;
   static CPXPacket_t tx; // per la risposta ACK
 
-  // --- MOD --- la route di risposta verrà decisa in base al mittente (HOST o PEER)
-  // cpxInitRoute(CPX_T_GAP8, CPX_T_WIFI_HOST, CPX_F_APP, &tx.route);
-
   while (1)
   {
-    // 1) ricezione bloccante
     cpxReceivePacketBlocking(CPX_F_APP, &rx);
 
-    // 2) log del payload ricevuto (safe string)
     char buf[257];
     int copy_len = (rx.dataLength < 256) ? rx.dataLength : 256;
     memcpy(buf, rx.data, copy_len);
     buf[copy_len] = '\0';
     cpxPrintToConsole(LOG_TO_CRTP, "[APP->GAP8] msg: %s\n", buf);
 
-    // se arriva un ACK dal peer, segno la bandierina
-
-    if (rx.route.source != CPX_T_WIFI_HOST)
+    // ack dal peer: non rispondo per evitare ping-pong
+    if (rx.route.source != CPX_T_WIFI_HOST && parseType(buf, "ack"))
     {
-
-      if (parseType(buf, "ack"))
-      {
-        peerAckSeen = 1;
-        cpxPrintToConsole(LOG_TO_CRTP, "Ricevuto ACK!\n");
-        // ack dal peer, non rispondo
-        continue;
-      }
+      peerAckSeen = 1;
+      cpxPrintToConsole(LOG_TO_CRTP, "Ricevuto ACK!\n");
+      continue; // === evita di inviare un altro ACK ===
     }
 
-    // 3) (opzionale) risposta ACK: se vuoi rispondere, mandala sul canale giusto
-    //    - da PC:      source tipico HOST -> rispondi a WIFI_HOST
-    //    - da DRONE:   arriva via ESP32/peer -> rispondi a WIFI_PEER
+    // rispondi con ACK solo se non è un ack e solo al mittente giusto
     memset(&tx, 0, sizeof(tx));
     if (rx.route.source == CPX_T_WIFI_HOST)
     {
@@ -647,7 +660,6 @@ void start_example(void)
 
   xTask = xTaskCreate(facedetection_task, "facedetection_task", configMINIMAL_STACK_SIZE * 4,
                       NULL, tskIDLE_PRIORITY + 1, NULL);
-
   if (xTask != pdPASS)
   {
     cpxPrintToConsole(LOG_TO_CRTP, "Camera task did not start !\n");

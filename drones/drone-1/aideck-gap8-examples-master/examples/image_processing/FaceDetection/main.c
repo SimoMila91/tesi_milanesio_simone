@@ -95,7 +95,7 @@ static const char *msgTypeToStr(MsgType_t type)
   }
 }
 
-// Helper JSON unica (NO varargs)
+// Helper JSON unica
 static void sendJsonMsg(CPXPacket_t *packet, MsgType_t type, const char *message, int count)
 {
   char msg[128];
@@ -129,7 +129,7 @@ static void sendJsonMsg(CPXPacket_t *packet, MsgType_t type, const char *message
   packet->dataLength = (uint16_t)len;
 
   cpxSendPacketBlocking(packet);
-  cpxPrintToConsole(LOG_TO_CRTP, "[GAP8->APP] sent: %s", msg);
+  cpxPrintToConsole(LOG_TO_CRTP, "[GAP8->PEER] sent: %s", msg);
 }
 
 void rx_task(void *parameters)
@@ -559,9 +559,6 @@ void rx_client_msg(void *parameters)
       }
     }
 
-    // 3) (opzionale) risposta ACK: se vuoi rispondere, mandala sul canale giusto
-    //    - da PC:      source tipico HOST -> rispondi a WIFI_HOST
-    //    - da DRONE:   arriva via ESP32/peer -> rispondi a WIFI_PEER
     memset(&tx, 0, sizeof(tx));
     if (rx.route.source == CPX_T_WIFI_HOST)
     {

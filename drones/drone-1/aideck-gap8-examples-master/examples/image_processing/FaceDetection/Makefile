@@ -18,8 +18,8 @@ APP = face_detection
 
 NB_FRAMES ?= -1
 
-STREAM_W = 160
-STREAM_H = 120
+STREAM_W = 320
+STREAM_H = 240
 
 FACE_DET_MODEL_SRC = FaceDetGenerator.c FaceDetModel.c
 FACE_DET_MODEL_GEN = FaceDetKernels
@@ -36,6 +36,7 @@ APP_CFLAGS += -DSTREAM_W=$(STREAM_W)
 APP_CFLAGS += -DSTREAM_H=$(STREAM_H)
 APP_INC += ../../../lib/cpx/inc
 APP_CFLAGS += -DconfigUSE_TIMERS=1 -DINCLUDE_xTimerPendFunctionCall=1
+APP_CFLAGS += -DUSE_CAMERA
 
 BOARD_NAME ?= ai_deck
 USE_PMSIS_BSP = 1
