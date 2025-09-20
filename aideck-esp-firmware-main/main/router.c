@@ -21,8 +21,8 @@ typedef struct
   CPXRoutablePacket_t txp;
 } RouteContext_t;
 
-// static RouteContext_t wifi_task_context;
-// static CPXRoutablePacket_t wifiRxBuf;
+static RouteContext_t wifi_task_context;
+static CPXRoutablePacket_t wifiRxBuf;
 
 static RouteContext_t gap8_task_context;
 static CPXRoutablePacket_t spiRxBuf;
@@ -42,7 +42,7 @@ typedef void (*Sender_t)(const CPXRoutablePacket_t *packet);
 static const int START_UP_GAP8_ROUTER_RUNNING = BIT0;
 static const int START_UP_CF_ROUTER_RUNNING = BIT1;
 static const int START_UP_ESP_ROUTER_RUNNING = BIT2;
-// static const int START_UP_WIFI_ROUTER_RUNNING = BIT3;
+static const int START_UP_WIFI_ROUTER_RUNNING = BIT3;
 static const int START_UP_WIFI_PEER_ROUTER_RUNNING = BIT4; // <— NUOVO
 static EventGroupHandle_t startUpEventGroup;
 #define TAG "ROUTER"
@@ -117,11 +117,9 @@ static void route(Receiver_t receive, CPXRoutablePacket_t *rxp, RouteContext_t *
       case CPX_T_ESP32:
         splitAndSend(rxp, context, espTransportSend, ESP_TRANSPORT_MTU - CPX_ROUTING_PACKED_SIZE);
         break;
-        /**
-         *  case CPX_T_WIFI_HOST:
-           splitAndSend(rxp, context, wifi_transport_send, WIFI_TRANSPORT_MTU - CPX_ROUTING_PACKED_SIZE);
-           break;
-         */
+      case CPX_T_WIFI_HOST:
+        splitAndSend(rxp, context, wifi_transport_send, WIFI_TRANSPORT_MTU - CPX_ROUTING_PACKED_SIZE);
+        break;
       case CPX_T_WIFI_PEER: // <— NUOVO: TX sul peer
         splitAndSend(rxp, context, wifi_peer_transport_send, WIFI_TRANSPORT_MTU - CPX_ROUTING_PACKED_SIZE);
         break;
@@ -154,14 +152,12 @@ static void router_from_esp32(void *_param)
   route(espTransportReceive, &espRxBuf, &esp_task_context, "ESP32");
 }
 
-/**
- * static void router_from_wifi(void *_param)
+// commenta per togliere 5000 host
+static void router_from_wifi(void *_param)
 {
   xEventGroupSetBits(startUpEventGroup, START_UP_WIFI_ROUTER_RUNNING);
   route(wifi_transport_receive, &wifiRxBuf, &wifi_task_context, "HOST");
 }
-
- */
 
 static void router_from_wifi_peer(void *_param)
 { // <— NUOVO
@@ -176,13 +172,13 @@ void router_init()
                        START_UP_GAP8_ROUTER_RUNNING |
                            START_UP_CF_ROUTER_RUNNING |
                            START_UP_ESP_ROUTER_RUNNING |
-                           // START_UP_WIFI_ROUTER_RUNNING |
+                           START_UP_WIFI_ROUTER_RUNNING |
                            START_UP_WIFI_PEER_ROUTER_RUNNING);
 
   xTaskCreate(router_from_gap8, "Router from GAP8", 5000, NULL, 1, NULL);
   xTaskCreate(router_from_crazyflie, "Router from CF", 5000, NULL, 1, NULL);
   xTaskCreate(router_from_esp32, "Router from ESP32", 5000, NULL, 1, NULL);
-  // xTaskCreate(router_from_wifi, "Router from WIFI", 5000, NULL, 1, NULL);
+  xTaskCreate(router_from_wifi, "Router from WIFI", 5000, NULL, 1, NULL);           // commenta
   xTaskCreate(router_from_wifi_peer, "Router from WIFI_PEER", 5000, NULL, 1, NULL); // <— NUOVO
 
   ESP_LOGI("ROUTER", "Waiting for tasks to start");
@@ -190,7 +186,7 @@ void router_init()
                       START_UP_GAP8_ROUTER_RUNNING |
                           START_UP_CF_ROUTER_RUNNING |
                           START_UP_ESP_ROUTER_RUNNING |
-                          // START_UP_WIFI_ROUTER_RUNNING |
+                          START_UP_WIFI_ROUTER_RUNNING | // commenta
                           START_UP_WIFI_PEER_ROUTER_RUNNING,
                       pdTRUE, pdTRUE, portMAX_DELAY);
 

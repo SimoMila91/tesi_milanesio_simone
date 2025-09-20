@@ -61,9 +61,9 @@ static char ssid[MAX_SSID_SIZE];
 static char key[MAX_SSID_SIZE];
 
 static const int WIFI_CONNECTED_BIT = BIT0;
-static const int WIFI_SOCKET_DISCONNECTED __attribute__((unused)) = BIT1;
-static const int WIFI_PACKET_WAIT_SEND __attribute__((unused)) = BIT2;
-static const int WIFI_PACKET_SENDING __attribute__((unused)) = BIT3;
+static const int WIFI_SOCKET_DISCONNECTED = BIT1;
+static const int WIFI_PACKET_WAIT_SEND = BIT2;
+static const int WIFI_PACKET_SENDING = BIT3;
 static EventGroupHandle_t s_wifi_event_group;
 
 static const int START_UP_MAIN_TASK = BIT0;
@@ -82,9 +82,9 @@ static xQueueHandle wifiTxQueue;
 static const char *TAG = "WIFI";
 
 /* Socket for receiving WiFi connections */
-// static int serverSock = -1;
+static int serverSock = -1;
 /* Accepted WiFi connection */
-// static int clientConnection = NO_CONNECTION;
+static int clientConnection = NO_CONNECTION;
 
 static int serverPeerSock = -1;
 static int peerConnection = NO_CONNECTION;
@@ -270,7 +270,7 @@ static void wifi_ctrl(void *_param)
     {
     case WIFI_CTRL_PEER_CONNECT:
     {
-      ESP_LOGI(TAG, "[CTRL] Peer connect request");
+      // ESP_LOGI(TAG, "[CTRL] Peer connect request");
 
       // payload: [ip(4)][port(2)] in network order (BE)
       const uint8_t *p = &rxp.data[1];
@@ -292,24 +292,24 @@ static void wifi_ctrl(void *_param)
       if (peerConnection != NO_CONNECTION &&
           currentPeerIpBE == ip_be && currentPeerPortBE == port_be)
       {
-        ESP_LOGI(TAG, "[PEER] Already connected to requested peer");
+        // ESP_LOGI(TAG, "[PEER] Already connected to requested peer");
         send_peer_status(1);
         break;
       }
 
-      // 2) Connesso ad altro peer -> BUSY (NON chiudere)
+      // 2) Connesso ad altro peer -> BUSY quindi non chiudo
       if (peerConnection != NO_CONNECTION)
       {
-        ESP_LOGW(TAG, "[PEER] Already connected to a different peer -> busy");
+        // ESP_LOGW(TAG, "[PEER] Already connected to a different peer -> busy");
         send_peer_status(2); // busy
         break;
       }
 
-      // 3) Libero: crea socket e prova a connetterti con timeout
+      // 3) creo socket e provo a connettermi con timeout
       int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
       if (fd < 0)
       {
-        ESP_LOGE(TAG, "[PEER] socket() errno=%d", errno);
+        // ESP_LOGE(TAG, "[PEER] socket() errno=%d", errno);
         send_peer_status(0); // down
         break;
       }
@@ -331,11 +331,11 @@ static void wifi_ctrl(void *_param)
       int rc = connect(fd, (struct sockaddr *)&peer, sizeof(peer));
       if (rc == 0)
       {
-        ok = true; // connesso subito (raro ma possibile)
+        ok = true; // connesso
       }
       else if (errno == EINPROGRESS)
       {
-        // Handshake in corso: attendi fino a 2s che diventi scrivibile
+        // Handshake in corso: attendo fino a 2s che diventi writable (connesso) o eccezione (fallito)
         fd_set wf, ef;
         FD_ZERO(&wf);
         FD_ZERO(&ef);
@@ -358,18 +358,18 @@ static void wifi_ctrl(void *_param)
       }
       else
       {
-        ok = false; // fallito subito
+        ok = false; // fallito
       }
 
       if (ok)
       {
         if (peerConnection != NO_CONNECTION)
         {
-          close(fd);           // evita leak
+          close(fd);           // evito leak
           send_peer_status(1); // up
           break;
         }
-        // Rimetti in bloccante per le send() della tua TX task
+        // rimetto blocking
         int fl2 = fcntl(fd, F_GETFL, 0);
         fcntl(fd, F_SETFL, fl2 & ~O_NONBLOCK);
 
@@ -377,12 +377,18 @@ static void wifi_ctrl(void *_param)
         currentPeerIpBE = ip_be;
         currentPeerPortBE = port_be;
 
+        struct timeval to = {.tv_sec = 0, .tv_usec = 500000};
+        setsockopt(peerConnection, SOL_SOCKET, SO_SNDTIMEO, &to, sizeof(to));
+        setsockopt(peerConnection, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
+        int on = 1;
+        setsockopt(peerConnection, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on));
+
         ESP_LOGI(TAG, "[PEER] Connect established");
         send_peer_status(1); // up
       }
       else
       {
-        ESP_LOGW(TAG, "[PEER] Connect failed/timeout, errno=%d", errno);
+        // ESP_LOGW(TAG, "[PEER] Connect failed/timeout, errno=%d", errno);
         close(fd);
         send_peer_status(0); // down
       }
@@ -445,18 +451,14 @@ static void wifi_ctrl(void *_param)
   }
 }
 
-/**
- * static void close_client_socket()
+static void close_client_socket()
 {
   close(clientConnection);
   clientConnection = NO_CONNECTION;
   xEventGroupSetBits(s_wifi_event_group, WIFI_SOCKET_DISCONNECTED);
 }
 
- */
-
-/**
- * void wifi_bind_socket()
+void wifi_bind_socket()
 {
   char addr_str[128];
   int addr_family;
@@ -490,12 +492,42 @@ static void wifi_ctrl(void *_param)
   ESP_LOGD(TAG, "Socket listening");
 }
 
- */
-
-/**
- * void wifi_wait_for_socket_connected()
+static void wifi_peer_bind_socket()
 {
-  ESP_LOGI(TAG, "Waiting for connection");
+  struct sockaddr_in destAddr = {0};
+  destAddr.sin_addr.s_addr = htonl(INADDR_ANY);
+  destAddr.sin_family = AF_INET;
+  destAddr.sin_port = htons(WIFI_PEER_TCP_PORT);
+
+  serverPeerSock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+  if (serverPeerSock < 0)
+  {
+    // ESP_LOGE(TAG, "[PEER] Unable to create socket: errno %d", errno);
+    return;
+  }
+  int on = 1;
+  setsockopt(serverPeerSock, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+
+  if (bind(serverPeerSock, (struct sockaddr *)&destAddr, sizeof(destAddr)) != 0)
+  {
+    // ESP_LOGE(TAG, "[PEER] bind: errno %d", errno);
+    close(serverPeerSock);
+    serverPeerSock = -1;
+    return;
+  }
+  if (listen(serverPeerSock, 1) != 0)
+  {
+    // ESP_LOGE(TAG, "[PEER] listen: errno %d", errno);
+    close(serverPeerSock);
+    serverPeerSock = -1;
+    return;
+  }
+  // ESP_LOGI(TAG, "[PEER] Listening on :%d", WIFI_PEER_TCP_PORT);
+}
+
+void wifi_wait_for_socket_connected()
+{
+  // ESP_LOGI(TAG, "Waiting for connection");
   struct sockaddr sourceAddr;
   uint addrLen = sizeof(sourceAddr);
   clientConnection = accept(serverSock, (struct sockaddr *)&sourceAddr, &addrLen);
@@ -508,18 +540,158 @@ static void wifi_ctrl(void *_param)
     ESP_LOGI(TAG, "Connection accepted");
   }
 }
- */
 
-/**
- * void wifi_wait_for_disconnect()
+static void wifi_peer_wait_for_socket_connected()
+{
+  ESP_LOGI(TAG, "[PEER] Waiting for connection");
+  struct sockaddr_in sourceAddr;
+  socklen_t addrLen = sizeof(sourceAddr);
+
+  int fd = accept(serverPeerSock, (struct sockaddr *)&sourceAddr, &addrLen);
+
+  if (fd < 0)
+  {
+    ESP_LOGE(TAG, "[PEER] Unable to accept connection: errno %d", errno);
+    return;
+  }
+
+  peerConnection = fd;                          // accetto la connessione
+  currentPeerIpBE = sourceAddr.sin_addr.s_addr; // già BE
+  currentPeerPortBE = sourceAddr.sin_port;      // già BE
+  // ESP_LOGI(TAG, "[PEER] Connection accepted");
+
+  struct timeval to = {.tv_sec = 0, .tv_usec = 500000};
+  setsockopt(peerConnection, SOL_SOCKET, SO_SNDTIMEO, &to, sizeof(to));
+  setsockopt(peerConnection, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
+  int on = 1;
+  setsockopt(peerConnection, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on));
+
+  uint32_t ip_ho = ntohl(currentPeerIpBE);
+  uint16_t port_ho = ntohs(currentPeerPortBE);
+  ESP_LOGI(TAG, "[PEER] connected from %u.%u.%u.%u:%u",
+           (ip_ho >> 24) & 0xFF, (ip_ho >> 16) & 0xFF,
+           (ip_ho >> 8) & 0xFF, ip_ho & 0xFF, port_ho);
+
+  // notifica UP al GAP8
+  send_peer_status(1);
+}
+
+void wifi_wait_for_disconnect()
 {
   xEventGroupWaitBits(s_wifi_event_group, WIFI_SOCKET_DISCONNECTED, pdTRUE, pdFALSE, portMAX_DELAY);
 }
 
- */
+static void wifi_task(void *pvParameters)
+{
 
-/**
- * void wifi_send_packet(const char *buffer, size_t size)
+  s_wifi_event_group = xEventGroupCreate();
+
+  esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, event_handler, NULL, NULL);
+  esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, event_handler, NULL, NULL);
+
+  wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+  ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+  uint8_t mac[6];
+  ESP_ERROR_CHECK(esp_wifi_get_mac(ESP_IF_WIFI_AP, mac));
+  ESP_LOGD(TAG, "AP MAC is %x:%x:%x:%x:%x:%x", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  ESP_ERROR_CHECK(esp_wifi_get_mac(ESP_IF_WIFI_STA, mac));
+  ESP_LOGD(TAG, "STA MAC is %x:%x:%x:%x:%x:%x", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+  wifi_bind_socket();
+  wifi_peer_bind_socket();
+
+  xEventGroupSetBits(startUpEventGroup, START_UP_MAIN_TASK);
+
+  // vTaskDelete(NULL);
+  while (1)
+  {
+    // blink_period_ms = 500;
+    wifi_wait_for_socket_connected();
+    ESP_LOGI(TAG, "Client connected");
+
+    // blink_period_ms = 100;
+
+    // Not thread safe!
+    cpxInitRoute(CPX_T_ESP32, CPX_T_GAP8, CPX_F_WIFI_CTRL, &txp.route);
+    txp.data[0] = WIFI_CTRL_STATUS_CLIENT_CONNECTED;
+    txp.data[1] = 1; // connected
+    txp.dataLength = 2;
+    espAppSendToRouterBlocking(&txp);
+
+    txp.route.destination = CPX_T_STM32;
+    espAppSendToRouterBlocking(&txp);
+
+    // Probably not the best, should be handled in some other way?
+    wifi_wait_for_disconnect();
+    ESP_LOGI(TAG, "Client disconnected");
+
+    // Not thread safe!
+    cpxInitRoute(CPX_T_ESP32, CPX_T_GAP8, CPX_F_WIFI_CTRL, &txp.route);
+    txp.data[0] = WIFI_CTRL_STATUS_CLIENT_CONNECTED;
+    txp.data[1] = 0; // disconnected
+    txp.dataLength = 2;
+    espAppSendToRouterBlocking(&txp);
+
+    txp.route.destination = CPX_T_STM32;
+    espAppSendToRouterBlocking(&txp);
+  }
+}
+
+static void wifi_peer_accept_task(void *pvParameters)
+{
+  for (;;)
+  {
+    if (peerConnection == NO_CONNECTION && serverPeerSock >= 0)
+    {
+      // blocca finché arriva un peer
+      wifi_peer_wait_for_socket_connected();
+      /**
+       * if (peerConnection != NO_CONNECTION)
+      {
+        // notifica UP al GAP8 (riusa il tuo canale CTRL)
+        send_peer_status(1); // up
+      }
+       */
+    }
+    else
+    {
+      vTaskDelay(pdMS_TO_TICKS(50));
+    }
+  }
+}
+
+void wifi_led_task(void *pvParameters)
+{
+  int ledstate = 0;
+  while (1)
+  {
+    if (peerConnection == NO_CONNECTION)
+    {
+      gpio_set_level(BLINK_GPIO, !ledstate);
+      ledstate = !ledstate;
+      vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    else
+    {
+      gpio_set_level(BLINK_GPIO, 1);
+      vTaskDelay(pdMS_TO_TICKS(200));
+      EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, WIFI_PACKET_SENDING | WIFI_PACKET_WAIT_SEND, pdFALSE, pdFALSE, portMAX_DELAY);
+      if (bits & WIFI_PACKET_SENDING)
+      {
+        gpio_set_level(BLINK_GPIO, 1);
+        xEventGroupClearBits(s_wifi_event_group, WIFI_PACKET_SENDING);
+      }
+      if (bits & WIFI_PACKET_WAIT_SEND)
+      {
+        gpio_set_level(BLINK_GPIO, 0);
+        xEventGroupClearBits(s_wifi_event_group, WIFI_PACKET_WAIT_SEND);
+      }
+    }
+  }
+}
+
+void wifi_send_packet(const char *buffer, size_t size)
 {
   if (clientConnection != NO_CONNECTION)
   {
@@ -535,10 +707,19 @@ static void wifi_ctrl(void *_param)
   }
 }
 
- */
+static void wifi_peer_send_packet(const char *buffer, size_t size)
+{
+  if (peerConnection == NO_CONNECTION)
+    return;
+  int sent = send(peerConnection, buffer, size, 0);
+  if (sent < 0)
+  {
+    ESP_LOGE(TAG, "[PEER] send error/timeout -> closing. errno=%d", errno);
+    close_peer_socket();
+  }
+}
 
-/**
- * static void wifi_sending_task(void *pvParameters)
+static void wifi_sending_task(void *pvParameters)
 {
   static WifiTransportPacket_t txp_wifi;
   static CPXRoutablePacket_t qPacket;
@@ -558,10 +739,22 @@ static void wifi_ctrl(void *_param)
   }
 }
 
- */
+static void wifi_peer_sending_task(void *pvParameters)
+{
+  static WifiTransportPacket_t txp_wifi;
+  static CPXRoutablePacket_t qPacket;
+  while (1)
+  {
+    xEventGroupSetBits(startUpEventGroup, START_UP_TX_TASK);
+    xQueueReceive(wifiPeerTxQueue, &qPacket, portMAX_DELAY);
+    txp_wifi.payloadLength = qPacket.dataLength + CPX_ROUTING_PACKED_SIZE;
+    cpxRouteToPacked(&qPacket.route, &txp_wifi.routablePayload.route);
+    memcpy(txp_wifi.routablePayload.data, qPacket.data, qPacket.dataLength);
+    wifi_peer_send_packet((const char *)&txp_wifi, txp_wifi.payloadLength + 2);
+  }
+}
 
-/**
- * static void wifi_receiving_task(void *pvParameters)
+static void wifi_receiving_task(void *pvParameters)
 {
   static WifiTransportPacket_t rxp_wifi;
   int len;
@@ -594,236 +787,76 @@ static void wifi_ctrl(void *_param)
   }
 }
 
- */
-
-static void wifi_peer_bind_socket()
-{
-  struct sockaddr_in destAddr = {0};
-  destAddr.sin_addr.s_addr = htonl(INADDR_ANY);
-  destAddr.sin_family = AF_INET;
-  destAddr.sin_port = htons(WIFI_PEER_TCP_PORT);
-
-  serverPeerSock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
-  if (serverPeerSock < 0)
-  {
-    ESP_LOGE(TAG, "[PEER] Unable to create socket: errno %d", errno);
-    return;
-  }
-  int on = 1;
-  setsockopt(serverPeerSock, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
-
-  if (bind(serverPeerSock, (struct sockaddr *)&destAddr, sizeof(destAddr)) != 0)
-  {
-    ESP_LOGE(TAG, "[PEER] bind: errno %d", errno);
-    close(serverPeerSock);
-    serverPeerSock = -1;
-    return;
-  }
-  if (listen(serverPeerSock, 1) != 0)
-  {
-    ESP_LOGE(TAG, "[PEER] listen: errno %d", errno);
-    close(serverPeerSock);
-    serverPeerSock = -1;
-    return;
-  }
-  ESP_LOGI(TAG, "[PEER] Listening on :%d", WIFI_PEER_TCP_PORT);
-}
-
-static void wifi_peer_wait_for_socket_connected()
-{
-  ESP_LOGI(TAG, "[PEER] Waiting for connection");
-  struct sockaddr_in sourceAddr;
-  socklen_t addrLen = sizeof(sourceAddr);
-
-  int fd = accept(serverPeerSock, (struct sockaddr *)&sourceAddr, &addrLen);
-
-  if (fd < 0)
-  {
-    ESP_LOGE(TAG, "[PEER] Unable to accept connection: errno %d", errno);
-    return;
-  }
-
-  peerConnection = fd;                          // accetta la connessione
-  currentPeerIpBE = sourceAddr.sin_addr.s_addr; // già BE
-  currentPeerPortBE = sourceAddr.sin_port;      // già BE
-  ESP_LOGI(TAG, "[PEER] Connection accepted");
-
-  uint32_t ip_ho = ntohl(currentPeerIpBE);
-  uint16_t port_ho = ntohs(currentPeerPortBE);
-  ESP_LOGI(TAG, "[PEER] from %u.%u.%u.%u:%u",
-           (ip_ho >> 24) & 0xFF, (ip_ho >> 16) & 0xFF,
-           (ip_ho >> 8) & 0xFF, ip_ho & 0xFF, port_ho);
-
-  // notifica UP al GAP8
-  send_peer_status(1);
-}
-
-static void wifi_task(void *pvParameters)
-{
-
-  // s_wifi_event_group = xEventGroupCreate();
-
-  esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, event_handler, NULL, NULL);
-  esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, event_handler, NULL, NULL);
-
-  wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-  ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
-  uint8_t mac[6];
-  ESP_ERROR_CHECK(esp_wifi_get_mac(ESP_IF_WIFI_AP, mac));
-  ESP_LOGD(TAG, "AP MAC is %x:%x:%x:%x:%x:%x", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-  ESP_ERROR_CHECK(esp_wifi_get_mac(ESP_IF_WIFI_STA, mac));
-  ESP_LOGD(TAG, "STA MAC is %x:%x:%x:%x:%x:%x", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-
-  // wifi_bind_socket();
-  wifi_peer_bind_socket();
-
-  xEventGroupSetBits(startUpEventGroup, START_UP_MAIN_TASK);
-
-  vTaskDelete(NULL);
-  /**
-   *   while (1)
-  {
-    // blink_period_ms = 500;
-    wifi_wait_for_socket_connected();
-    ESP_LOGI(TAG, "Client connected");
-
-    // blink_period_ms = 100;
-
-    // Not thread safe!
-    cpxInitRoute(CPX_T_ESP32, CPX_T_GAP8, CPX_F_WIFI_CTRL, &txp.route);
-    txp.data[0] = WIFI_CTRL_STATUS_CLIENT_CONNECTED;
-    txp.data[1] = 1; // connected
-    txp.dataLength = 2;
-    espAppSendToRouterBlocking(&txp);
-
-    txp.route.destination = CPX_T_STM32;
-    espAppSendToRouterBlocking(&txp);
-
-    // Probably not the best, should be handled in some other way?
-    wifi_wait_for_disconnect();
-    ESP_LOGI(TAG, "Client disconnected");
-
-    // Not thread safe!
-    cpxInitRoute(CPX_T_ESP32, CPX_T_GAP8, CPX_F_WIFI_CTRL, &txp.route);
-    txp.data[0] = WIFI_CTRL_STATUS_CLIENT_CONNECTED;
-    txp.data[1] = 0; // disconnected
-    txp.dataLength = 2;
-    espAppSendToRouterBlocking(&txp);
-
-    txp.route.destination = CPX_T_STM32;
-    espAppSendToRouterBlocking(&txp);
-  }
-   */
-}
-
-static void wifi_peer_accept_task(void *pvParameters)
-{
-  for (;;)
-  {
-    if (peerConnection == NO_CONNECTION && serverPeerSock >= 0)
-    {
-      // blocca finché arriva un peer
-      wifi_peer_wait_for_socket_connected();
-    }
-    else
-    {
-      vTaskDelay(pdMS_TO_TICKS(50));
-    }
-  }
-}
-
-void wifi_led_task(void *pvParameters)
-{
-  int ledstate = 0;
-  while (1)
-  {
-    if (peerConnection == NO_CONNECTION)
-    {
-      gpio_set_level(BLINK_GPIO, !ledstate);
-      ledstate = !ledstate;
-      vTaskDelay(pdMS_TO_TICKS(500));
-    }
-    else
-    {
-      gpio_set_level(BLINK_GPIO, 1);
-      vTaskDelay(pdMS_TO_TICKS(200));
-      /**
-       * EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, WIFI_PACKET_SENDING | WIFI_PACKET_WAIT_SEND, pdFALSE, pdFALSE, portMAX_DELAY);
-      if (bits & WIFI_PACKET_SENDING)
-      {
-        gpio_set_level(BLINK_GPIO, 1);
-        xEventGroupClearBits(s_wifi_event_group, WIFI_PACKET_SENDING);
-      }
-      if (bits & WIFI_PACKET_WAIT_SEND)
-      {
-        gpio_set_level(BLINK_GPIO, 0);
-        xEventGroupClearBits(s_wifi_event_group, WIFI_PACKET_WAIT_SEND);
-      }
-       */
-    }
-  }
-}
-
-static void wifi_peer_send_packet(const char *buffer, size_t size)
-{
-  if (peerConnection != NO_CONNECTION)
-  {
-    int err = send(peerConnection, buffer, size, 0);
-    if (err < 0)
-    {
-      ESP_LOGE(TAG, "[PEER] send errno %d", errno);
-      close_peer_socket();
-    }
-  }
-}
-
-static void wifi_peer_sending_task(void *pvParameters)
-{
-  static WifiTransportPacket_t txp_wifi;
-  static CPXRoutablePacket_t qPacket;
-  while (1)
-  {
-    xEventGroupSetBits(startUpEventGroup, START_UP_TX_TASK);
-    xQueueReceive(wifiPeerTxQueue, &qPacket, portMAX_DELAY);
-    txp_wifi.payloadLength = qPacket.dataLength + CPX_ROUTING_PACKED_SIZE;
-    cpxRouteToPacked(&qPacket.route, &txp_wifi.routablePayload.route);
-    memcpy(txp_wifi.routablePayload.data, qPacket.data, qPacket.dataLength);
-    wifi_peer_send_packet((const char *)&txp_wifi, txp_wifi.payloadLength + 2);
-  }
-}
-
 static void wifi_peer_receiving_task(void *pvParameters)
 {
   xEventGroupSetBits(startUpEventGroup, START_UP_RX_TASK);
   static WifiTransportPacket_t rxp_wifi;
-  int len;
-  while (1)
+
+  for (;;)
   {
     if (peerConnection == NO_CONNECTION)
     {
       vTaskDelay(pdMS_TO_TICKS(50));
       continue;
     }
-    len = recv(peerConnection, &rxp_wifi, 2, 0);
-    if (len > 0)
+
+    // === 1) leggo 2 byte di header (payloadLength) ===
+    uint8_t hdr[2];
+    int need = 2, got = 0;
+    while (got < need)
     {
-      int totalRxLen = 0;
-      do
+      int r = recv(peerConnection, hdr + got, need - got, 0);
+      if (r == 0)
+      { // peer ha chiuso
+        close_peer_socket();
+        goto next_iter;
+      }
+      if (r < 0)
       {
-        len = recv(peerConnection, &rxp_wifi.payload[totalRxLen], rxp_wifi.payloadLength - totalRxLen, 0);
-        totalRxLen += len;
-      } while (totalRxLen < rxp_wifi.payloadLength);
-      xQueueSend(wifiPeerRxQueue, &rxp_wifi, portMAX_DELAY);
+        // timeout/errore
+        vTaskDelay(pdMS_TO_TICKS(10));
+        goto next_iter;
+      }
+      got += r;
     }
-    else if (len == 0)
+
+    // ricostruisco
+    uint16_t payloadLen = 0;
+    memcpy(&payloadLen, hdr, 2);
+
+    if (payloadLen == 0 || payloadLen > sizeof(rxp_wifi.payload))
     {
+      ESP_LOGW(TAG, "[PEER] invalid payloadLength=%u -> closing", payloadLen);
       close_peer_socket();
+      goto next_iter;
     }
-    else
+
+    rxp_wifi.payloadLength = payloadLen; // opzionale: per coerenza interna
+
+    // === 2) leggo payload
+    int total = 0;
+    while (total < payloadLen)
     {
-      vTaskDelay(10);
+      int r = recv(peerConnection, &rxp_wifi.payload[total], payloadLen - total, 0);
+      if (r == 0)
+      { // peer ha chiuso durante il payload
+        close_peer_socket();
+        goto next_iter;
+      }
+      if (r < 0)
+      {
+        // timeout/errore temporaneo: meglio chiudere
+        ESP_LOGW(TAG, "[PEER] recv payload timeout/err -> closing");
+        close_peer_socket();
+        goto next_iter;
+      }
+      total += r;
     }
+
+    // === 3) Consegnalo alla coda del router ===
+    xQueueSend(wifiPeerRxQueue, &rxp_wifi, portMAX_DELAY);
+
+  next_iter:; // nulla
   }
 }
 
@@ -831,6 +864,13 @@ void wifi_transport_send(const CPXRoutablePacket_t *packet)
 {
   assert(packet->dataLength <= WIFI_TRANSPORT_MTU - CPX_ROUTING_PACKED_SIZE);
   xQueueSend(wifiTxQueue, packet, portMAX_DELAY);
+}
+
+/* ---- Transport PEER (4242) esposto al router ---- */
+void wifi_peer_transport_send(const CPXRoutablePacket_t *packet)
+{
+  assert(packet->dataLength <= WIFI_TRANSPORT_MTU - CPX_ROUTING_PACKED_SIZE);
+  xQueueSend(wifiPeerTxQueue, packet, portMAX_DELAY);
 }
 
 void wifi_transport_receive(CPXRoutablePacket_t *packet)
@@ -844,13 +884,6 @@ void wifi_transport_receive(CPXRoutablePacket_t *packet)
   cpxPackedToRoute(&qPacket.routablePayload.route, &packet->route);
 
   memcpy(packet->data, qPacket.routablePayload.data, packet->dataLength);
-}
-
-/* ---- Transport PEER (4242) esposto al router ---- */
-void wifi_peer_transport_send(const CPXRoutablePacket_t *packet)
-{
-  assert(packet->dataLength <= WIFI_TRANSPORT_MTU - CPX_ROUTING_PACKED_SIZE);
-  xQueueSend(wifiPeerTxQueue, packet, portMAX_DELAY);
 }
 
 void wifi_peer_transport_receive(CPXRoutablePacket_t *packet)
@@ -868,16 +901,16 @@ void wifi_init()
 
   s_wifi_event_group = xEventGroupCreate();
 
-  // wifiRxQueue = xQueueCreate(WIFI_HOST_QUEUE_LENGTH, sizeof(WifiTransportPacket_t));
-  // wifiTxQueue = xQueueCreate(WIFI_HOST_QUEUE_LENGTH, sizeof(CPXRoutablePacket_t));
+  wifiRxQueue = xQueueCreate(WIFI_HOST_QUEUE_LENGTH, sizeof(WifiTransportPacket_t)); // per ora non commento
+  wifiTxQueue = xQueueCreate(WIFI_HOST_QUEUE_LENGTH, sizeof(CPXRoutablePacket_t));   // per ora non commento
   wifiPeerRxQueue = xQueueCreate(WIFI_PEER_QUEUE_LENGTH, sizeof(WifiTransportPacket_t));
   wifiPeerTxQueue = xQueueCreate(WIFI_PEER_QUEUE_LENGTH, sizeof(CPXRoutablePacket_t));
 
   startUpEventGroup = xEventGroupCreate();
   xEventGroupClearBits(startUpEventGroup, START_UP_MAIN_TASK | START_UP_RX_TASK | START_UP_TX_TASK | START_UP_CTRL_TASK);
   xTaskCreate(wifi_task, "WiFi TASK", 5000, NULL, 1, NULL);
-  // xTaskCreate(wifi_sending_task, "WiFi TX", 5000, NULL, 1, NULL);
-  // xTaskCreate(wifi_receiving_task, "WiFi RX", 5000, NULL, 1, NULL);
+  xTaskCreate(wifi_sending_task, "WiFi TX", 5000, NULL, 1, NULL);   // per ora non commento
+  xTaskCreate(wifi_receiving_task, "WiFi RX", 5000, NULL, 1, NULL); // per ora non commento
   xTaskCreate(wifi_peer_accept_task, "WiFi PEER ACCEPT", 4096, NULL, 1, NULL);
   xTaskCreate(wifi_peer_sending_task, "WiFi PEER TX", 5000, NULL, 1, NULL);
   xTaskCreate(wifi_peer_receiving_task, "WiFi PEER RX", 5000, NULL, 1, NULL);
