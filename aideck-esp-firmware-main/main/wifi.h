@@ -29,6 +29,10 @@
 
 #include "cpx.h"
 
+#define WIFI_MCAST_GROUP_IP   "239.255.42.42"   // indirizzo multicast
+#define WIFI_MCAST_PORT       4242              // porta comune
+#define WIFI_MCAST_TTL        1                 // limite dominio locale
+
 #define WIFI_TRANSPORT_MTU 1022
 
 #if WIFI_TRANSPORT_MTU > CPX_MAX_PAYLOAD_SIZE

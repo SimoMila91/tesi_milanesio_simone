@@ -57,7 +57,6 @@ static uint32_t encodingTime = 0;
 static volatile int wifiConnected = 0;
 static volatile int wifiClientConnected = 0;
 static volatile int wifiPeerConnected = 0;
-static volatile int wifiPeerBusy = 0; // stato busy del peer (2)
 static volatile int peerAckSeen = 0;
 // === fine flag ===
 
@@ -349,15 +348,6 @@ static int requestPeerConnectBlocking(uint32_t timeout_ms)
   {
     if (wifiPeerConnected)
       return 1;
-
-    if (wifiPeerBusy)
-    {
-      // 2 = occupato con altro peer
-      cpxPrintToConsole(LOG_TO_CRTP, "[peer] status=BUSY (2). Abort on-demand connect in this cycle.\n");
-      return 0;
-    }
-
-    // non busy: provo CONNECT ogni ~300ms
     if ((now_ms() - lastTry) >= 300)
     {
       CPXPacket_t txCtrl = (CPXPacket_t){0};
@@ -398,14 +388,9 @@ void rx_task(void *parameters)
       break;
     case WIFI_CTRL_PEER_STATUS:
     {
-      // 0=down, 1=up, 2=busy
-      uint8_t st = wifiCtrl->data[0];
-      wifiPeerConnected = (st == 1);
-      wifiPeerBusy = (st == 2);
-      if (st == 2)
-        cpxPrintToConsole(LOG_TO_CRTP, "Wifi peer status: busy\n");
-      else
-        cpxPrintToConsole(LOG_TO_CRTP, "Wifi peer status: %u\n", st);
+      // 0=down, 1=up 
+      wifiPeerConnected = (wifiCtrl->data[0] == 1);
+      cpxPrintToConsole(LOG_TO_CRTP, "Wifi peer status: %u\n", st);
       break;
     }
     default:
@@ -657,14 +642,11 @@ void facedetection_task(void *parameters)
         {
           cpxPrintToConsole(LOG_TO_CRTP, "[peer] not connected, trying to connect...\n");
           int ok = requestPeerConnectBlocking(3000);
-          cpxPrintToConsole(LOG_TO_CRTP, "[peer] connect result: ok=%d, connected=%d, busy=%d\n",
-                            ok, wifiPeerConnected, wifiPeerBusy);
+          cpxPrintToConsole(LOG_TO_CRTP, "[peer] connect result: ok=%d, connected=%d\n",
+                            ok, wifiPeerConnected);
           if (!ok)
           {
-            if (wifiPeerBusy)
-              cpxPrintToConsole(LOG_TO_CRTP, "[peer] busy (2): skip send this cycle\n");
-            else
-              cpxPrintToConsole(LOG_TO_CRTP, "[peer] connect timeout: skip send this cycle\n");
+            cpxPrintToConsole(LOG_TO_CRTP, "[peer] connect timeout: skip send this cycle\n");
           }
         }
 
@@ -755,27 +737,20 @@ void rx_client_msg(void *parameters)
         continue;
       }
 
-      /**
-       *
-      // Inoltro payload allo STM32 (trasparente)
-      memset(&txSt, 0, sizeof(txSt));
-      cpxInitRoute(CPX_T_GAP8, CPX_T_STM32, CPX_F_APP, &txSt.route);
-      int len = rx.dataLength;
-      if (len > (int)sizeof(txSt.data))
-        len = sizeof(txSt.data);
-      memcpy(txSt.data, rx.data, len);
-      txSt.dataLength = (uint16_t)len;
-      cpxSendPacketBlocking(&txSt);
-       */
-
       // Logica locale per takeoff/land (auto-land a 10s)
-      if (streq(action, "takeoff") == 1)
+    if (streq(action, "takeoff") == 1)
       {
         if (!in_air)
         {
+          // Inoltro payload allo STM32 
+          cpxInitRoute(CPX_T_GAP8, CPX_T_STM32, CPX_F_APP, &txSt.route);
+          txSt.data[0] = 1;
+          txSt.dataLength = 1;
+
+          cpxSendPacketBlocking(&txSt);
           in_air = 1;
-          airborne_until_ms = now_ms() + 10000; // 10 s fissi
-          cpxPrintToConsole(LOG_TO_CRTP, "[AIR] takeoff received: in_air=1 until %u ms\n", (unsigned)airborne_until_ms);
+          airborne_until_ms = now_ms() + 10000; // 10 s
+          //cpxPrintToConsole(LOG_TO_CRTP, "[AIR] takeoff received: in_air=1 until %u ms\n", (unsigned)airborne_until_ms);
         }
         else
         {
@@ -784,8 +759,14 @@ void rx_client_msg(void *parameters)
       }
       else if (streq(action, "land") == 1)
       {
+        
+        cpxInitRoute(CPX_T_GAP8, CPX_T_STM32, CPX_F_APP, &txSt.route);
+        txPacket.data[0] = 2;
+        txPacket.dataLength = 1;
+
+        cpxSendPacketBlocking(&txSt);
         in_air = 0; // atterro subito se ricevuto comando esplicito
-        cpxPrintToConsole(LOG_TO_CRTP, "[AIR] land received: in_air=0\n");
+        //cpxPrintToConsole(LOG_TO_CRTP, "[AIR] land received: in_air=0\n");
       }
 
       // No ack
@@ -810,7 +791,8 @@ void rx_client_msg(void *parameters)
 // ===== Task di gestione auto-land (polling su now_ms) =====
 static void air_mgr_task(void *parameters)
 {
-  (void)parameters;
+  static CPXPacket_t sender; 
+  
   while (1)
   {
     if (in_air)
@@ -818,24 +800,16 @@ static void air_mgr_task(void *parameters)
       uint32_t now = now_ms();
       if (now >= airborne_until_ms)
       {
-        /**
-         *  // invio {"type":"cmd","action":"land"} allo STM32
-         CPXPacket_t txLand = (CPXPacket_t){0};
-         cpxInitRoute(CPX_T_GAP8, CPX_T_STM32, CPX_F_APP, &txLand.route);
-         const char *msg = "{\"type\":\"cmd\",\"action\":\"land\"}\n";
-         size_t len = strlen(msg);
-         if (len > sizeof(txLand.data))
-           len = sizeof(txLand.data);
-         memcpy(txLand.data, msg, len);
-         txLand.dataLength = (uint16_t)len;
-         cpxSendPacketBlocking(&txLand);
-         */
-
+        cpxInitRoute(CPX_T_GAP8, CPX_T_STM32, CPX_F_APP, &sender.route);
+        sender.data[0] = 2;
+        sender.dataLength = 1;
+        cpxSendPacketBlocking(&sender);
+        
         in_air = 0; // reset stato
         cpxPrintToConsole(LOG_TO_CRTP, "[AUTO-LAND] sent to STM32, in_air=0\n");
       }
     }
-    vTaskDelay(pdMS_TO_TICKS(20)); // ~50 Hz
+    vTaskDelay(pdMS_TO_TICKS(500)); 
   }
 }
 

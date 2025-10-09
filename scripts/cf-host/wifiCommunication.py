@@ -21,7 +21,6 @@ CPX_F_APP       = 5
 CPX_VERSION = 0
 
 # === Framing TCP ===
-# [ length:2 LITTLE ][ header:2 BIG ][ payload ]
 LEN_ENDIAN = "little"  # SOLO per la length TCP
 
 # ---------------- CPX framing ----------------
